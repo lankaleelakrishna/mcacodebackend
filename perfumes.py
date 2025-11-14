@@ -527,7 +527,6 @@ def update_best_seller():
         return jsonify({'error': 'Database error'}), 500
     finally:
         conn.close()
-
 @perfumes_bp.route('/admin/perfumes', methods=['DELETE'])
 def delete_perfume():
     _, err, code = verify_admin_token(request)
@@ -540,14 +539,21 @@ def delete_perfume():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # First delete from order_items (child table)
+            cursor.execute("DELETE FROM order_items WHERE perfume_id = %s", (perfume_id,))
+            
+            # Then delete the perfume (parent table)
             cursor.execute("DELETE FROM perfumes WHERE id = %s", (perfume_id,))
-            if cursor.rowcount == 0:
-                return jsonify({'error': 'Product not found'}), 404
+            rowcount = cursor.rowcount
+        
+        if rowcount == 0:
+            return jsonify({'error': 'Perfume not found'}), 404
+        
         conn.commit()
-        return jsonify({'message': 'Product deleted successfully'}), 200
+        return jsonify({'message': 'Perfume deleted successfully'}), 200
     except Exception as e:
         conn.rollback()
-        logger.error(f"Error deleting product: {str(e)}")
+        logger.error(f"Error deleting perfume: {str(e)}")
         return jsonify({'error': 'Database error'}), 500
     finally:
         conn.close()
