@@ -31,6 +31,25 @@ def get_db_connection():
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+
+# Normalize and validate sizes for reuse across endpoints
+ALLOWED_CLOTHING_SIZES = {'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL'}
+def normalize_size_for_storage(size_str):
+    """Return normalized size string for DB storage (comma-separated uppercase or volume like '30ml') or None if invalid."""
+    if not size_str:
+        return None
+    parts = [p.strip().upper() for p in size_str.split(',') if p.strip()]
+    if not parts:
+        return None
+    # allow single volume like 30ml
+    if len(parts) == 1 and re.match(r'^\d+ml$', parts[0].lower()):
+        return parts[0]
+    # validate clothing sizes
+    for p in parts:
+        if p not in ALLOWED_CLOTHING_SIZES:
+            return None
+    return ','.join(parts)
+
 # === UPDATED: Categories are now tops, lehangas, sarees ===
 def validate_perfume_data(name, price_str, category, size, quantity_str=None, description=None, top_notes=None, heart_notes=None, base_notes=None):
     """Validate product data. Returns (is_valid, error_message)"""
@@ -50,8 +69,31 @@ def validate_perfume_data(name, price_str, category, size, quantity_str=None, de
     if category not in ['tops', 'lehangas', 'sarees']:
         return False, "Category must be 'tops', 'lehangas', or 'sarees'"
     
-    if not size or not re.match(r'^\d+ml$', size):
-        return False, "Size must be a valid format (e.g., '30ml', '50ml', '100ml')"
+    # Accept either volume sizes like '30ml' or clothing sizes (possibly comma-separated)
+    if not size:
+        return False, "Size is required"
+
+    # Normalize and validate sizes
+    allowed_clothing = {'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL'}
+    def _parse_sizes(sz):
+        if not sz:
+            return None
+        # allow comma-separated clothing sizes (e.g. "s,m,l,xl")
+        parts = [p.strip().upper() for p in sz.split(',') if p.strip()]
+        if not parts:
+            return None
+        # single volume like 30ml (allow digits followed by 'ml')
+        if len(parts) == 1 and re.match(r'^\d+ml$', parts[0].lower()):
+            return parts
+        # otherwise ensure every part is a valid clothing size
+        for p in parts:
+            if p not in allowed_clothing:
+                return None
+        return parts
+
+    parsed_sizes = _parse_sizes(size)
+    if not parsed_sizes:
+        return False, "Size must be clothing sizes like 'S' or 'M,L,XL' or a volume like '30ml'"
     
     if quantity_str is not None:
         try:
@@ -169,7 +211,11 @@ def add_perfume():
     if not name or not price_str or not category or not size:
         return jsonify({'error': 'Name, price, category, and size are required'}), 400
 
-    is_valid, validation_error = validate_perfume_data(name, price_str, category, size, quantity_str, description, top_notes, heart_notes, base_notes)
+    normalized_size = normalize_size_for_storage(size)
+    if not normalized_size:
+        return jsonify({'error': "Size must be clothing sizes like 'S' or 'M,L,XL' or a volume like '30ml'"}), 400
+
+    is_valid, validation_error = validate_perfume_data(name, price_str, category, normalized_size, quantity_str, description, top_notes, heart_notes, base_notes)
     if not is_valid:
         return jsonify({'error': validation_error}), 400
 
@@ -192,7 +238,7 @@ def add_perfume():
                 INSERT INTO perfumes (name, description, price, quantity, available, photo, created_at, category, size, top_notes, heart_notes, base_notes) 
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
-            cursor.execute(sql, (name, description, price_str, quantity, available, photo_data, datetime.now(), category, size, top_notes, heart_notes, base_notes))
+            cursor.execute(sql, (name, description, price_str, quantity, available, photo_data, datetime.now(), category, normalized_size, top_notes, heart_notes, base_notes))
             perfume_id = cursor.lastrowid
         conn.commit()
         return jsonify({
@@ -227,6 +273,13 @@ def get_perfumes_admin():
     finally:
         conn.close()
     
+    # normalize size field into sizes list for admin view as well
+    for p in perfumes:
+        if p.get('size'):
+            p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
+        else:
+            p['sizes'] = []
+
     return jsonify({'perfumes': perfumes}), 200
 
 @perfumes_bp.route('/admin/perfumes', methods=['PUT'])
@@ -303,11 +356,15 @@ def update_perfume():
                 update_params.append(category)
 
             if size is not None:
-                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], size)
+                # Normalize and validate provided size
+                normalized_size = normalize_size_for_storage(size)
+                if not normalized_size:
+                    return jsonify({'error': "Size must be clothing sizes like 'S' or 'M,L,XL' or a volume like '30ml'"}), 400
+                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], normalized_size)
                 if not is_valid:
                     return jsonify({'error': validation_error}), 400
                 update_fields.append("size = %s")
-                update_params.append(size)
+                update_params.append(normalized_size)
 
             if top_notes is not None:
                 is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], existing['size'], None, None, top_notes)
@@ -580,6 +637,11 @@ def get_best_sellers():
                 p['photo_url'] = f"{base_url}/perfumes/photo/{p['id']}"
                 p['in_stock'] = p['quantity'] > 0
                 p['stock_level'] = 'low' if p['quantity'] <= 5 else 'available'
+                # expose sizes as a list for frontend convenience
+                if p.get('size'):
+                    p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
+                else:
+                    p['sizes'] = []
                 
     except Exception as e:
         logger.error(f"Error retrieving best sellers: {str(e)}")
@@ -609,6 +671,10 @@ def get_new_arrivals():
                 p['photo_url'] = f"{base_url}/perfumes/photo/{p['id']}"
                 p['in_stock'] = p['quantity'] > 0
                 p['stock_level'] = 'low' if p['quantity'] <= 5 else 'available'
+                if p.get('size'):
+                    p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
+                else:
+                    p['sizes'] = []
                 
     except Exception as e:
         logger.error(f"Error retrieving new arrivals: {str(e)}")
@@ -644,6 +710,10 @@ def get_special_offers():
                 discount = float(p['discount_percentage'])
                 p['original_price'] = original_price
                 p['discounted_price'] = round(original_price * (1 - discount/100), 2)
+                if p.get('size'):
+                    p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
+                else:
+                    p['sizes'] = []
                 
     except Exception as e:
         logger.error(f"Error retrieving special offers: {str(e)}")
@@ -689,6 +759,10 @@ def view_perfumes():
                 p['photo_url'] = f"{base_url}/perfumes/photo/{p['id']}"
                 p['in_stock'] = p['quantity'] > 0
                 p['stock_level'] = 'low' if p['quantity'] <= 5 else 'available'
+                if p.get('size'):
+                    p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
+                else:
+                    p['sizes'] = []
                 
     except Exception as e:
         logger.error(f"Error retrieving products: {str(e)}")
@@ -714,6 +788,10 @@ def get_perfume_details(perfume_id):
                 perfume['photo_url'] = f"{base_url}/perfumes/photo/{perfume['id']}"
                 perfume['in_stock'] = perfume['quantity'] > 0 and perfume['available'] == 1
                 perfume['stock_level'] = 'low' if perfume['quantity'] <= 5 else 'available'
+                if perfume.get('size'):
+                    perfume['sizes'] = [s.strip() for s in perfume['size'].split(',') if s.strip()]
+                else:
+                    perfume['sizes'] = []
     except Exception as e:
         logger.error(f"Error retrieving product: {str(e)}")
         return jsonify({'error': 'Failed to retrieve product'}), 500

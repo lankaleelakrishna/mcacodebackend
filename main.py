@@ -4,6 +4,7 @@ from auth import auth_bp
 from perfumes import perfumes_bp
 from cart import cart_bp
 from favorites import favorites_bp          # ← NEW: Favorites blueprint
+from revenue import revenue_bp              # ← NEW: Revenue blueprint
 from flask_cors import CORS
 import logging
 
@@ -35,6 +36,7 @@ app.register_blueprint(auth_bp)          # → /login, /register
 app.register_blueprint(perfumes_bp)      # → /perfumes, /perfumes/photo/1
 app.register_blueprint(cart_bp)          # → /cart, /cart/5
 app.register_blueprint(favorites_bp)     # → /favorites, /favorites/1
+app.register_blueprint(revenue_bp)       # → /admin/sales/report, /admin/revenue/*
 
 # ========================================
 # Serve Frontend (Vite)
