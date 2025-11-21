@@ -19,6 +19,10 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 def get_db_connection():
     return pymysql.connect(
         host=Config.DB_HOST,
@@ -31,6 +35,12 @@ def get_db_connection():
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+
+ADMIN_EMAIL = Config.ADMIN_EMAIL
+SMTP_SERVER = Config.SMTP_SERVER
+SMTP_PORT = Config.SMTP_PORT
+SMTP_USER = Config.SMTP_USER
+SMTP_PASS = Config.SMTP_PASS
 
 # Normalize and validate sizes for reuse across endpoints
 ALLOWED_CLOTHING_SIZES = {'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL'}
@@ -616,6 +626,32 @@ def delete_perfume():
         conn.close()
 
 # ==================== PUBLIC ROUTES ====================
+# Contact form endpoint
+@perfumes_bp.route('/contact', methods=['POST'])
+def contact():
+    data = request.json
+    name = data.get('name')
+    email = data.get('email')
+    subject = data.get('subject')
+    message = data.get('message')
+
+    # Compose email
+    msg = MIMEMultipart()
+    msg['From'] = SMTP_USER
+    msg['To'] = ADMIN_EMAIL
+    msg['Subject'] = f"Contact Form: {subject}"
+    body = f"Name: {name}\nEmail: {email}\nSubject: {subject}\nMessage: {message}"
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, ADMIN_EMAIL, msg.as_string())
+        server.quit()
+        return jsonify({"success": True, "message": "Message sent to admin."}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @perfumes_bp.route('/perfumes/best-sellers', methods=['GET'])
 def get_best_sellers():

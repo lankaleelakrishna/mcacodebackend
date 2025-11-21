@@ -16,3 +16,9 @@ class Config:
         'image/bmp': 'bmp',
         'image/webp': 'webp'
     }
+    # Email configuration
+    ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'dpprasad468@gmail.com')
+    SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+    SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
+    SMTP_USER = os.getenv('SMTP_USER', 'dpprasad468@gmail.com')
+    SMTP_PASS = os.getenv('SMTP_PASS', 'kfid rfrf iyxg fbam')
