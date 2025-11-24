@@ -4,9 +4,8 @@ import pymysql
 from config import Config
 import jwt
 from functools import wraps
-import logging
 from datetime import datetime
-
+import logging
 
 cart_bp = Blueprint('cart', __name__)
 logger = logging.getLogger(__name__)
@@ -89,7 +88,6 @@ def attach_order_items(cursor, orders, base_url):
         cursor.execute("""
             SELECT 
                 oi.perfume_id, p.name, oi.quantity,
-                COALESCE(oi.size, p.size) AS size,
                 oi.unit_price,
                 (oi.quantity * oi.unit_price) AS subtotal
             FROM order_items oi
@@ -130,24 +128,19 @@ def add_to_cart():
             try:
                 pid = int(item['perfume_id'])
                 qty = int(item.get('quantity', 1))
-                size = item.get('size')
             except (ValueError, TypeError):
                 errors.append({"perfume_id": item.get('perfume_id'), "error": "Invalid data"})
                 continue
-
-            cursor.execute("SELECT quantity, size FROM perfumes WHERE id = %s AND available = 1", (pid,))
+            cursor.execute("SELECT quantity FROM perfumes WHERE id = %s AND available = 1", (pid,))
             perfume = cursor.fetchone()
             if not perfume:
                 errors.append({"perfume_id": pid, "error": "Perfume not available"})
                 continue
 
             stock = perfume['quantity']
-            db_size = perfume['size']
-            use_size = size if size else db_size
-
             cursor.execute(
-                "SELECT quantity FROM carts WHERE user_id = %s AND perfume_id = %s AND COALESCE(size, '') = COALESCE(%s, '')",
-                (user_id, pid, use_size)
+                "SELECT quantity FROM carts WHERE user_id = %s AND perfume_id = %s",
+                (user_id, pid)
             )
             current = cursor.fetchone()
             current_qty = current['quantity'] if current else 0
@@ -155,16 +148,14 @@ def add_to_cart():
             if new_total > stock:
                 errors.append({"perfume_id": pid, "error": f"Only {stock} in stock (you have {current_qty})"})
                 continue
-
             cursor.execute("""
-                INSERT INTO carts (user_id, perfume_id, quantity, size)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO carts (user_id, perfume_id, quantity)
+                VALUES (%s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    quantity = VALUES(quantity),
-                    size = COALESCE(VALUES(size), size)
-            """, (user_id, pid, new_total, use_size))
+                    quantity = VALUES(quantity)
+            """, (user_id, pid, new_total))
 
-            added.append({"perfume_id": pid, "total_in_cart": new_total, "size": use_size})
+            added.append({"perfume_id": pid, "total_in_cart": new_total})
 
         conn.commit()
 
@@ -195,7 +186,7 @@ def view_cart():
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT c.id, c.perfume_id, p.name, p.price, c.quantity, COALESCE(c.size, p.size) AS size,
+            SELECT c.id, c.perfume_id, p.name, p.price, c.quantity,
                    p.quantity AS stock, c.added_at
             FROM carts c
             JOIN perfumes p ON c.perfume_id = p.id
@@ -320,7 +311,6 @@ def checkout():
             try:
                 perfume_id = int(item['perfume_id'])
                 quantity = int(item['quantity'])
-                size = item.get('selectedSize') or None
                 unit_price = float(item['price'])
             except (KeyError, ValueError, TypeError):
                 conn.rollback()
@@ -340,9 +330,9 @@ def checkout():
                 return jsonify({"error": f"Only {perfume['quantity']} left of {perfume['name']}"}), 400
 
             cursor.execute("""
-                INSERT INTO order_items (order_id, perfume_id, quantity, size, unit_price)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (order_id, perfume_id, quantity, size, unit_price))
+                INSERT INTO order_items (order_id, perfume_id, quantity, unit_price)
+                VALUES (%s, %s, %s, %s)
+            """, (order_id, perfume_id, quantity, unit_price))
 
             cursor.execute("UPDATE perfumes SET quantity = quantity - %s WHERE id = %s", (quantity, perfume_id))
 
@@ -574,3 +564,149 @@ def admin_all_orders():
     finally:
         cursor.close()
         conn.close()
+
+
+
+@cart_bp.route('/admin/orders/<int:order_id>/tracking-code', methods=['PUT'])
+def update_tracking_code(order_id):
+    # Your logic to update tracking code
+    return jsonify({'success': True})
+
+# Helper to apply updates (shipment/tracking/status)
+def _apply_order_updates(cursor, order_id, data):
+    """Apply updates to the orders table and return the updated row.
+    Raises ValueError on bad input."""
+    updates = []
+    params = []
+
+    # support both snake_case and camelCase keys
+    shipment_val = data.get('shipment_id') if isinstance(data, dict) else None
+    if shipment_val is None:
+        shipment_val = data.get('shipmentId') if isinstance(data, dict) else None
+    tracking_val = data.get('tracking_id') if isinstance(data, dict) else None
+    if tracking_val is None:
+        tracking_val = data.get('trackingId') if isinstance(data, dict) else None
+    provider_val = data.get('shipping_provider') if isinstance(data, dict) else None
+    if provider_val is None:
+        provider_val = data.get('shippingProvider') if isinstance(data, dict) else None
+    status_val = data.get('status') if isinstance(data, dict) else None
+
+    if shipment_val is not None:
+        updates.append('shipment_id = %s')
+        params.append(shipment_val)
+    if tracking_val is not None:
+        updates.append('tracking_id = %s')
+        params.append(tracking_val)
+    if provider_val is not None:
+        updates.append('shipping_provider = %s')
+        params.append(provider_val)
+    if status_val is not None:
+        updates.append('status = %s')
+        params.append(status_val)
+
+    if not updates:
+        raise ValueError('No updatable fields provided')
+
+    # verify order exists
+    cursor.execute('SELECT id FROM orders WHERE id = %s', (order_id,))
+    order = cursor.fetchone()
+    if not order:
+        raise ValueError('Order not found')
+
+    set_clause = ', '.join(updates)
+    sql = f'UPDATE orders SET {set_clause} WHERE id = %s'
+    cursor.execute(sql, params + [order_id])
+
+    cursor.execute('SELECT id, status, shipment_id, tracking_id, shipping_provider FROM orders WHERE id = %s', (order_id,))
+    return cursor.fetchone()
+
+
+# Accept PUT /admin/orders/<id> (frontend default)
+@cart_bp.route('/admin/orders/<int:order_id>', methods=['PUT'])
+@admin_required
+def admin_update_order(order_id):
+    data = request.get_json(silent=True) or {}
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database unavailable'}), 500
+    cursor = conn.cursor()
+    try:
+        updated = _apply_order_updates(cursor, order_id, data)
+        conn.commit()
+        return jsonify({'message': 'Order updated', 'order': updated}), 200
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Admin update order error (admin {request.admin_id}, order {order_id}): {e}")
+        return jsonify({'error': 'Failed to update order', 'details': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# Accept PUT /admin/orders with id in body (some frontend variants)
+@cart_bp.route('/admin/orders', methods=['PUT'])
+@admin_required
+def admin_update_order_by_body():
+    data = request.get_json(silent=True) or {}
+    order_id = data.get('order_id') or data.get('orderId') or data.get('id')
+    if not order_id:
+        return jsonify({'error': 'order_id is required in body'}), 400
+    try:
+        order_id = int(order_id)
+    except (ValueError, TypeError):
+        return jsonify({'error': 'order_id must be an integer'}), 400
+
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database unavailable'}), 500
+    cursor = conn.cursor()
+    try:
+        updated = _apply_order_updates(cursor, order_id, data)
+        conn.commit()
+        return jsonify({'message': 'Order updated', 'order': updated}), 200
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Admin update order (body) error (admin {request.admin_id}, order {order_id}): {e}")
+        return jsonify({'error': 'Failed to update order', 'details': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# Accept POST /admin/orders/shipment for older clients
+@cart_bp.route('/admin/orders/shipment', methods=['POST'])
+@admin_required
+def admin_update_order_shipment():
+    data = request.get_json(silent=True) or {}
+    order_id = data.get('order_id') or data.get('orderId') or data.get('id')
+    if not order_id:
+        return jsonify({'error': 'order_id is required'}), 400
+    try:
+        order_id = int(order_id)
+    except (ValueError, TypeError):
+        return jsonify({'error': 'order_id must be an integer'}), 400
+
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database unavailable'}), 500
+    cursor = conn.cursor()
+    try:
+        updated = _apply_order_updates(cursor, order_id, data)
+        conn.commit()
+        return jsonify({'message': 'Shipment updated', 'order': updated}), 200
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Admin update order shipment error (admin {request.admin_id}, order {order_id}): {e}")
+        return jsonify({'error': 'Failed to update shipment', 'details': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+        
