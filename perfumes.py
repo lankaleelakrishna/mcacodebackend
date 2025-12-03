@@ -7,7 +7,12 @@ from werkzeug.utils import secure_filename
 from config import Config
 from datetime import datetime
 import logging
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+
 
 perfumes_bp = Blueprint('perfumes', __name__)
 
@@ -19,10 +24,6 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
 def get_db_connection():
     return pymysql.connect(
         host=Config.DB_HOST,
@@ -31,7 +32,6 @@ def get_db_connection():
         database=Config.DB_NAME,
         cursorclass=pymysql.cursors.DictCursor
     )
-
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -42,27 +42,10 @@ SMTP_PORT = Config.SMTP_PORT
 SMTP_USER = Config.SMTP_USER
 SMTP_PASS = Config.SMTP_PASS
 
-# Normalize and validate sizes for reuse across endpoints
-ALLOWED_CLOTHING_SIZES = {'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL'}
-def normalize_size_for_storage(size_str):
-    """Return normalized size string for DB storage (comma-separated uppercase or volume like '30ml') or None if invalid."""
-    if not size_str:
-        return None
-    parts = [p.strip().upper() for p in size_str.split(',') if p.strip()]
-    if not parts:
-        return None
-    # allow single volume like 30ml
-    if len(parts) == 1 and re.match(r'^\d+ml$', parts[0].lower()):
-        return parts[0]
-    # validate clothing sizes
-    for p in parts:
-        if p not in ALLOWED_CLOTHING_SIZES:
-            return None
-    return ','.join(parts)
-
-# === UPDATED: Categories are now tops, lehangas, sarees ===
-def validate_perfume_data(name, price_str, category, size, quantity_str=None, description=None, top_notes=None, heart_notes=None, base_notes=None):
-    """Validate product data. Returns (is_valid, error_message)"""
+def validate_perfume_data(name, price_str, category, quantity_str=None, description=None, top_notes=None, heart_notes=None, base_notes=None):
+    """Validate perfume data. Returns (is_valid, error_message)
+    Note: `size` was removed from the model; this validator no longer checks size.
+    """
     if not name or len(name.strip()) < 2:
         return False, "Name must be at least 2 characters long"
     
@@ -75,36 +58,8 @@ def validate_perfume_data(name, price_str, category, size, quantity_str=None, de
     except ValueError:
         return False, "Price must be a valid number"
     
-    # CHANGED: tops, lehangas, sarees
     if category not in ['tops', 'lehangas', 'sarees']:
         return False, "Category must be 'tops', 'lehangas', or 'sarees'"
-    
-    # Accept either volume sizes like '30ml' or clothing sizes (possibly comma-separated)
-    if not size:
-        return False, "Size is required"
-
-    # Normalize and validate sizes
-    allowed_clothing = {'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL'}
-    def _parse_sizes(sz):
-        if not sz:
-            return None
-        # allow comma-separated clothing sizes (e.g. "s,m,l,xl")
-        parts = [p.strip().upper() for p in sz.split(',') if p.strip()]
-        if not parts:
-            return None
-        # single volume like 30ml (allow digits followed by 'ml')
-        if len(parts) == 1 and re.match(r'^\d+ml$', parts[0].lower()):
-            return parts
-        # otherwise ensure every part is a valid clothing size
-        for p in parts:
-            if p not in allowed_clothing:
-                return None
-        return parts
-
-    parsed_sizes = _parse_sizes(size)
-    if not parsed_sizes:
-        return False, "Size must be clothing sizes like 'S' or 'M,L,XL' or a volume like '30ml'"
-    
     if quantity_str is not None:
         try:
             quantity = int(quantity_str)
@@ -157,33 +112,16 @@ def validate_cart_data(items):
 
 def verify_admin_token(request):
     auth = request.headers.get("Authorization")
-    # Log a short preview (do not log full token)
-    logger.info(f"verify_admin_token: Authorization header preview: {str(auth)[:64]!r}")
-
-    if not auth:
-        return None, jsonify({"error": "Missing token"}), 401
-
-    # Accept either raw token or Bearer <token> for backward compatibility
-    if auth.lower().startswith("bearer "):
-        # strip scheme and use the token part
-        auth = auth.split(None, 1)[1]
-
+    if not auth or auth.lower().startswith("bearer "):
+        return None, jsonify({"error": "Use raw token, not Bearer"}), 401
     try:
         payload = jwt.decode(auth.strip(), Config.SECRET_KEY, algorithms=["HS256"])
         if payload.get("role_id") != 1:
             return None, jsonify({"error": "Admin access required"}), 403
         return payload, None, None
     except jwt.ExpiredSignatureError:
-        logger.exception("Token expired when verifying admin token")
         return None, jsonify({"error": "Token expired"}), 401
-    except jwt.InvalidSignatureError:
-        logger.exception("Invalid signature when verifying admin token")
-        return None, jsonify({"error": "Invalid token (signature)"}), 401
-    except jwt.DecodeError:
-        logger.exception("Decode error when verifying admin token")
-        return None, jsonify({"error": "Invalid token (decode error)"}), 401
-    except Exception:
-        logger.exception("Unexpected error when verifying admin token")
+    except jwt.InvalidTokenError:
         return None, jsonify({"error": "Invalid token"}), 401
 
 def verify_customer_token(request):
@@ -200,67 +138,108 @@ def verify_customer_token(request):
     except jwt.InvalidTokenError:
         return None, jsonify({"error": "Invalid token"}), 401
 
-# ==================== ADMIN ROUTES ====================
-
 @perfumes_bp.route('/admin/perfumes', methods=['POST'])
 def add_perfume():
-    _, err, code = verify_admin_token(request)
-    if err: return err, code
+    payload, err, code = verify_admin_token(request)
+    if err:
+        return err, code
 
-    name = request.form.get('name', '').strip()
-    description = request.form.get('description', '')
-    price_str = request.form.get('price')
-    quantity_str = request.form.get('quantity', '100')
-    category = request.form.get('category')  # tops, lehangas, sarees
-    size = request.form.get('size')
-    top_notes = request.form.get('top_notes', '')
-    heart_notes = request.form.get('heart_notes', '')
-    base_notes = request.form.get('base_notes', '')
-    photo = request.files.get('photo')
+    # === REQUIRED ===
+    name      = request.form.get('name', '').strip()
+    price_raw = request.form.get('price')
+    category  = request.form.get('category')
 
-    if not name or not price_str or not category or not size:
-        return jsonify({'error': 'Name, price, category, and size are required'}), 400
+    logger.info(f"add_perfume: received name={name!r}, price={price_raw!r}, category={category!r}")
 
-    normalized_size = normalize_size_for_storage(size)
-    if not normalized_size:
-        return jsonify({'error': "Size must be clothing sizes like 'S' or 'M,L,XL' or a volume like '30ml'"}), 400
+    if not name or not price_raw or not category:
+        return jsonify({'error': 'Name, price and category are required'}), 400
 
-    is_valid, validation_error = validate_perfume_data(name, price_str, category, normalized_size, quantity_str, description, top_notes, heart_notes, base_notes)
-    if not is_valid:
-        return jsonify({'error': validation_error}), 400
+    if category not in ['tops', 'lehangas', 'sarees']:
+        logger.warning(f"add_perfume: invalid category {category!r}, expected one of ['tops', 'lehangas', 'sarees']")
+        return jsonify({'error': f'Invalid category {category!r}. Expected one of: tops, lehangas, sarees'}), 400
 
-    photo_data = None
-    if photo and photo.filename:
-        if not allowed_file(photo.filename):
-            return jsonify({'error': 'Invalid file type'}), 400
-        photo_data = photo.read()
-        if len(photo_data) > MAX_FILE_SIZE:
-            return jsonify({'error': 'File too large'}), 400
-        photo.seek(0)
+    # === PRICE → string (works with every MySQL driver) ===
+    try:
+        price = str(Decimal(price_raw.strip()))
+        if Decimal(price) <= 0:
+            return jsonify({'error': 'Price must be > 0'}), 400
+    except (InvalidOperation, ValueError):
+        return jsonify({'error': 'Invalid price (use e.g. 299.99)'}), 400
 
-    quantity = int(quantity_str)
-    available = 1 if quantity > 0 else 0
+    # === QUANTITY ===
+    qty_raw = request.form.get('quantity', '100').strip()
+    try:
+        quantity = int(qty_raw)
+        if quantity < 0:
+            raise ValueError
+    except ValueError:
+        return jsonify({'error': 'Quantity must be a non-negative integer'}), 400
 
+    # === OPTIONAL TEXT FIELDS ===
+    description = request.form.get('description', '').strip() or None
+    top_notes   = request.form.get('top_notes', '').strip() or None
+    heart_notes = request.form.get('heart_notes', '').strip() or None
+    base_notes  = request.form.get('base_notes', '').strip() or None
+
+    # === SIZES REMOVED ===
+    # The `size` field was removed from the data model. Clients should not send `size`.
+
+    # === PHOTO — NEVER send None to LONGBLOB! ===
+    photo_data = b''  # empty bytes = no photo
+    if 'photo' in request.files:
+        photo = request.files['photo']
+        if photo and photo.filename:
+            ext = photo.filename.rsplit('.', 1)[-1].lower() if '.' in photo.filename else ''
+            if ext not in ['jpg', 'jpeg', 'png']:
+                return jsonify({'error': 'Photo must be JPG or PNG'}), 400
+            photo_data = photo.read()
+            if len(photo_data) > 5 * 1024 * 1024:
+                return jsonify({'error': 'Photo must be ≤ 5MB'}), 400
+
+    # === DATABASE INSERT ===
     conn = get_db_connection()
     try:
-        with conn.cursor() as cursor:
-            sql = """
-                INSERT INTO perfumes (name, description, price, quantity, available, photo, created_at, category, size, top_notes, heart_notes, base_notes) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            cursor.execute(sql, (name, description, price_str, quantity, available, photo_data, datetime.now(), category, normalized_size, top_notes, heart_notes, base_notes))
-            perfume_id = cursor.lastrowid
+        with conn.cursor() as cur:
+            # Try insert with description column
+            try:
+                cur.execute("""
+                    INSERT INTO perfumes 
+                    (name, price, description, quantity, available, photo, created_at, category,
+                     top_notes, heart_notes, base_notes)
+                    VALUES (%s, %s, %s, %s, 1, %s, NOW(), %s, %s, %s, %s)
+                """, (
+                    name, price, description, quantity, photo_data,
+                    category,
+                    top_notes, heart_notes, base_notes
+                ))
+            except Exception as e:
+                # Fallback for old DB without description column
+                if 'unknown column' in str(e).lower() and 'description' in str(e).lower():
+                    cur.execute("""
+                        INSERT INTO perfumes 
+                        (name, price, quantity, available, photo, created_at, category,
+                         top_notes, heart_notes, base_notes)
+                        VALUES (%s, %s, %s, 1, %s, NOW(), %s, %s, %s, %s)
+                    """, (
+                        name, price, quantity, photo_data,
+                        category,
+                        top_notes, heart_notes, base_notes
+                    ))
+                else:
+                    raise
+
+            perfume_id = cur.lastrowid or conn.insert_id()
+
         conn.commit()
         return jsonify({
-            'message': 'Product added successfully',
-            'perfume_id': perfume_id,
-            'quantity': quantity,
-            'available': bool(available)
+            'message': 'Perfume added successfully!',
+            'id': perfume_id
         }), 201
+
     except Exception as e:
         conn.rollback()
-        logger.error(f"Database error adding product: {str(e)}")
-        return jsonify({'error': 'Database error'}), 500
+        logger.exception("ADD PERFUME FAILED")   # ← full traceback in logs
+        return jsonify({'error': 'Server error — check logs'}), 500
     finally:
         conn.close()
 
@@ -273,23 +252,16 @@ def get_perfumes_admin():
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT id, name, description, price, quantity, available, created_at, updated_at, category, size, top_notes, heart_notes, base_notes
+                SELECT id, name, description, price, quantity, available, created_at, updated_at, category, top_notes, heart_notes, base_notes
                 FROM perfumes ORDER BY id DESC
             """)
             perfumes = cursor.fetchall()
     except Exception as e:
-        logger.error(f"Error retrieving products: {str(e)}")
-        return jsonify({'error': 'Failed to retrieve products'}), 500
+        logger.error(f"Error retrieving perfumes: {str(e)}")
+        return jsonify({'error': 'Failed to retrieve perfumes'}), 500
     finally:
         conn.close()
     
-    # normalize size field into sizes list for admin view as well
-    for p in perfumes:
-        if p.get('size'):
-            p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
-        else:
-            p['sizes'] = []
-
     return jsonify({'perfumes': perfumes}), 200
 
 @perfumes_bp.route('/admin/perfumes', methods=['PUT'])
@@ -308,7 +280,6 @@ def update_perfume():
     price_str = request.form.get('price')
     quantity_str = request.form.get('quantity')
     category = request.form.get('category')
-    size = request.form.get('size')
     top_notes = request.form.get('top_notes')
     heart_notes = request.form.get('heart_notes')
     base_notes = request.form.get('base_notes')
@@ -318,32 +289,35 @@ def update_perfume():
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT id, name, description, price, quantity, available, category, size, top_notes, heart_notes, base_notes
+                SELECT id, name, description, price, quantity, available, category, top_notes, heart_notes, base_notes
                 FROM perfumes WHERE id = %s
             """, (perfume_id,))
             existing = cursor.fetchone()
             if not existing:
-                return jsonify({'error': 'Product not found'}), 404
+                return jsonify({'error': 'Perfume not found'}), 404
 
+            # Prepare fields to update
             update_fields = []
             update_params = []
 
+            # Validate and add fields only if provided
             if name is not None:
-                is_valid, validation_error = validate_perfume_data(name, str(existing['price']), existing['category'], existing['size'])
+                temp_name = name
+                is_valid, validation_error = validate_perfume_data(temp_name, str(existing['price']), existing['category'])
                 if not is_valid:
                     return jsonify({'error': validation_error}), 400
                 update_fields.append("name = %s")
                 update_params.append(name)
 
             if description is not None:
-                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], existing['size'], None, description)
+                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], description=description)
                 if not is_valid:
                     return jsonify({'error': validation_error}), 400
                 update_fields.append("description = %s")
                 update_params.append(description)
 
             if price_str is not None:
-                is_valid, validation_error = validate_perfume_data(existing['name'], price_str, existing['category'], existing['size'])
+                is_valid, validation_error = validate_perfume_data(existing['name'], price_str, existing['category'])
                 if not is_valid:
                     return jsonify({'error': validation_error}), 400
                 update_fields.append("price = %s")
@@ -351,7 +325,7 @@ def update_perfume():
 
             new_quantity = existing['quantity']
             if quantity_str is not None:
-                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], existing['size'], quantity_str)
+                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], quantity_str)
                 if not is_valid:
                     return jsonify({'error': validation_error}), 400
                 new_quantity = int(quantity_str)
@@ -359,39 +333,30 @@ def update_perfume():
                 update_params.append(new_quantity)
 
             if category is not None:
-                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), category, existing['size'])
+                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), category)
                 if not is_valid:
                     return jsonify({'error': validation_error}), 400
                 update_fields.append("category = %s")
                 update_params.append(category)
 
-            if size is not None:
-                # Normalize and validate provided size
-                normalized_size = normalize_size_for_storage(size)
-                if not normalized_size:
-                    return jsonify({'error': "Size must be clothing sizes like 'S' or 'M,L,XL' or a volume like '30ml'"}), 400
-                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], normalized_size)
-                if not is_valid:
-                    return jsonify({'error': validation_error}), 400
-                update_fields.append("size = %s")
-                update_params.append(normalized_size)
+            # `size` removed — ignore size updates entirely.
 
             if top_notes is not None:
-                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], existing['size'], None, None, top_notes)
+                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], top_notes=top_notes)
                 if not is_valid:
                     return jsonify({'error': validation_error}), 400
                 update_fields.append("top_notes = %s")
                 update_params.append(top_notes)
 
             if heart_notes is not None:
-                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], existing['size'], None, None, None, heart_notes)
+                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], heart_notes=heart_notes)
                 if not is_valid:
                     return jsonify({'error': validation_error}), 400
                 update_fields.append("heart_notes = %s")
                 update_params.append(heart_notes)
 
             if base_notes is not None:
-                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], existing['size'], None, None, None, None, base_notes)
+                is_valid, validation_error = validate_perfume_data(existing['name'], str(existing['price']), existing['category'], base_notes=base_notes)
                 if not is_valid:
                     return jsonify({'error': validation_error}), 400
                 update_fields.append("base_notes = %s")
@@ -418,17 +383,19 @@ def update_perfume():
 
             update_params.append(perfume_id)
 
-            sql = f"UPDATE perfumes SET {', '.join(update_fields)} WHERE id = %s"
+            sql = f"""
+                UPDATE perfumes SET {', '.join(update_fields)} WHERE id = %s
+            """
             cursor.execute(sql, update_params)
 
             if cursor.rowcount == 0:
                 return jsonify({'error': 'No changes made'}), 400
 
         conn.commit()
-        return jsonify({'message': 'Product updated successfully'}), 200
+        return jsonify({'message': 'Perfume updated successfully'}), 200
     except Exception as e:
         conn.rollback()
-        logger.error(f"Error updating product: {str(e)}")
+        logger.error(f"Error updating perfume: {str(e)}")
         return jsonify({'error': 'Database error'}), 500
     finally:
         conn.close()
@@ -455,17 +422,20 @@ def add_special_offer():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # Check if perfume exists
             cursor.execute("SELECT id FROM perfumes WHERE id = %s", (perfume_id,))
             if not cursor.fetchone():
-                return jsonify({'error': 'Product not found'}), 404
+                return jsonify({'error': 'Perfume not found'}), 404
 
+            # Check if there's already an active discount
             cursor.execute("""
                 SELECT id FROM discounts 
                 WHERE perfume_id = %s AND end_date >= CURRENT_DATE()
             """, (perfume_id,))
             if cursor.fetchone():
-                return jsonify({'error': 'Product already has an active special offer'}), 400
+                return jsonify({'error': 'Perfume already has an active special offer'}), 400
 
+            # Add new discount
             cursor.execute("""
                 INSERT INTO discounts (perfume_id, discount_percentage, start_date, end_date) 
                 VALUES (%s, %s, CURRENT_DATE(), %s)
@@ -502,13 +472,15 @@ def update_special_offer(perfume_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # Check if discount exists and is active
             cursor.execute("""
                 SELECT id FROM discounts 
                 WHERE perfume_id = %s AND end_date >= CURRENT_DATE()
             """, (perfume_id,))
             if not cursor.fetchone():
-                return jsonify({'error': 'No active special offer found for this product'}), 404
+                return jsonify({'error': 'No active special offer found for this perfume'}), 404
 
+            # Update fields
             update_fields = []
             update_params = []
             
@@ -521,7 +493,11 @@ def update_special_offer(perfume_id):
 
             update_params.append(perfume_id)
             
-            sql = f"UPDATE discounts SET {', '.join(update_fields)} WHERE perfume_id = %s AND end_date >= CURRENT_DATE()"
+            sql = f"""
+                UPDATE discounts 
+                SET {', '.join(update_fields)}
+                WHERE perfume_id = %s AND end_date >= CURRENT_DATE()
+            """
             cursor.execute(sql, update_params)
             
         conn.commit()
@@ -541,13 +517,14 @@ def delete_special_offer(perfume_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # Delete active discount
             cursor.execute("""
                 DELETE FROM discounts 
                 WHERE perfume_id = %s AND end_date >= CURRENT_DATE()
             """, (perfume_id,))
             
             if cursor.rowcount == 0:
-                return jsonify({'error': 'No active special offer found for this product'}), 404
+                return jsonify({'error': 'No active special offer found for this perfume'}), 404
                 
         conn.commit()
         return jsonify({'message': 'Special offer deleted successfully'}), 200
@@ -572,28 +549,35 @@ def update_best_seller():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # First check if perfume exists
             cursor.execute("SELECT id FROM perfumes WHERE id = %s", (perfume_id,))
             if not cursor.fetchone():
-                return jsonify({'error': 'Product not found'}), 404
+                return jsonify({'error': 'Perfume not found'}), 404
 
+            # Update the is_best_seller status
             cursor.execute("""
                 UPDATE perfumes 
-                SET is_best_seller = %s, updated_at = %s
+                SET is_best_seller = %s,
+                    updated_at = %s
                 WHERE id = %s
             """, (is_best_seller, datetime.now(), perfume_id))
 
+            if cursor.rowcount == 0:
+                return jsonify({'error': 'No changes made'}), 400
+
         conn.commit()
         return jsonify({
-            'message': f"Product {'added to' if is_best_seller else 'removed from'} best sellers",
+            'message': f"Perfume {'added to' if is_best_seller else 'removed from'} best sellers successfully",
             'perfume_id': perfume_id,
             'is_best_seller': is_best_seller
         }), 200
     except Exception as e:
         conn.rollback()
-        logger.error(f"Error updating best seller: {str(e)}")
+        logger.error(f"Error updating best seller status: {str(e)}")
         return jsonify({'error': 'Database error'}), 500
     finally:
         conn.close()
+
 @perfumes_bp.route('/admin/perfumes', methods=['DELETE'])
 def delete_perfume():
     _, err, code = verify_admin_token(request)
@@ -625,59 +609,31 @@ def delete_perfume():
     finally:
         conn.close()
 
-# ==================== PUBLIC ROUTES ====================
-# Contact form endpoint
-@perfumes_bp.route('/contact', methods=['POST'])
-def contact():
-    data = request.json
-    name = data.get('name')
-    email = data.get('email')
-    subject = data.get('subject')
-    message = data.get('message')
-
-    # Compose email
-    msg = MIMEMultipart()
-    msg['From'] = SMTP_USER
-    msg['To'] = ADMIN_EMAIL
-    msg['Subject'] = f"Contact Form: {subject}"
-    body = f"Name: {name}\nEmail: {email}\nSubject: {subject}\nMessage: {message}"
-    msg.attach(MIMEText(body, 'plain'))
-
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, ADMIN_EMAIL, msg.as_string())
-        server.quit()
-        return jsonify({"success": True, "message": "Message sent to admin."}), 200
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
+# PUBLIC ROUTES
 @perfumes_bp.route('/perfumes/best-sellers', methods=['GET'])
 def get_best_sellers():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # Get perfumes marked as best sellers
             sql = """
                 SELECT p.id, p.name, p.description, p.price, p.quantity, p.available, 
-                       p.category, p.size, p.top_notes, p.heart_notes, p.base_notes
+                       p.category, p.top_notes, p.heart_notes, p.base_notes
                 FROM perfumes p
-                WHERE p.available = 1 AND p.is_best_seller = 1
-                ORDER BY p.created_at DESC LIMIT 10
+                WHERE p.available = 1
+                AND p.is_best_seller = 1
+                ORDER BY p.created_at DESC
+                LIMIT 10
             """
             cursor.execute(sql)
             best_sellers = cursor.fetchall()
             
+            # Add photo URLs and stock information
             base_url = request.host_url.rstrip('/')
-            for p in best_sellers:
-                p['photo_url'] = f"{base_url}/perfumes/photo/{p['id']}"
-                p['in_stock'] = p['quantity'] > 0
-                p['stock_level'] = 'low' if p['quantity'] <= 5 else 'available'
-                # expose sizes as a list for frontend convenience
-                if p.get('size'):
-                    p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
-                else:
-                    p['sizes'] = []
+            for perfume in best_sellers:
+                perfume['photo_url'] = f"{base_url}/perfumes/photo/{perfume['id']}"
+                perfume['in_stock'] = perfume['quantity'] > 0
+                perfume['stock_level'] = 'low' if perfume['quantity'] <= 5 else 'available'
                 
     except Exception as e:
         logger.error(f"Error retrieving best sellers: {str(e)}")
@@ -692,25 +648,25 @@ def get_new_arrivals():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # Get the most recently added perfumes (last 30 days)
             sql = """
                 SELECT id, name, description, price, quantity, available, 
-                       category, size, top_notes, heart_notes, base_notes, created_at
+                       category, top_notes, heart_notes, base_notes, created_at
                 FROM perfumes
-                WHERE available = 1 AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-                ORDER BY created_at DESC LIMIT 10
+                WHERE available = 1
+                AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+                ORDER BY created_at DESC
+                LIMIT 10
             """
             cursor.execute(sql)
             new_arrivals = cursor.fetchall()
             
+            # Add photo URLs and stock information
             base_url = request.host_url.rstrip('/')
-            for p in new_arrivals:
-                p['photo_url'] = f"{base_url}/perfumes/photo/{p['id']}"
-                p['in_stock'] = p['quantity'] > 0
-                p['stock_level'] = 'low' if p['quantity'] <= 5 else 'available'
-                if p.get('size'):
-                    p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
-                else:
-                    p['sizes'] = []
+            for perfume in new_arrivals:
+                perfume['photo_url'] = f"{base_url}/perfumes/photo/{perfume['id']}"
+                perfume['in_stock'] = perfume['quantity'] > 0
+                perfume['stock_level'] = 'low' if perfume['quantity'] <= 5 else 'available'
                 
     except Exception as e:
         logger.error(f"Error retrieving new arrivals: {str(e)}")
@@ -725,31 +681,31 @@ def get_special_offers():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # Get perfumes with special offers (assuming a discount field or special price)
             sql = """
                 SELECT p.id, p.name, p.description, p.price, p.quantity, p.available, 
-                       p.category, p.size, p.top_notes, p.heart_notes, p.base_notes,
+                       p.category, p.top_notes, p.heart_notes, p.base_notes,
                        d.discount_percentage, d.end_date
                 FROM perfumes p
                 JOIN discounts d ON p.id = d.perfume_id
-                WHERE p.available = 1 AND d.end_date >= CURRENT_DATE()
+                WHERE p.available = 1
+                AND d.end_date >= CURRENT_DATE()
                 ORDER BY d.discount_percentage DESC
             """
             cursor.execute(sql)
             special_offers = cursor.fetchall()
             
+            # Add photo URLs, stock information, and calculate discounted prices
             base_url = request.host_url.rstrip('/')
-            for p in special_offers:
-                p['photo_url'] = f"{base_url}/perfumes/photo/{p['id']}"
-                p['in_stock'] = p['quantity'] > 0
-                p['stock_level'] = 'low' if p['quantity'] <= 5 else 'available'
-                original_price = float(p['price'])
-                discount = float(p['discount_percentage'])
-                p['original_price'] = original_price
-                p['discounted_price'] = round(original_price * (1 - discount/100), 2)
-                if p.get('size'):
-                    p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
-                else:
-                    p['sizes'] = []
+            for perfume in special_offers:
+                perfume['photo_url'] = f"{base_url}/perfumes/photo/{perfume['id']}"
+                perfume['in_stock'] = perfume['quantity'] > 0
+                perfume['stock_level'] = 'low' if perfume['quantity'] <= 5 else 'available'
+                # Calculate discounted price
+                original_price = float(perfume['price'])
+                discount = float(perfume['discount_percentage'])
+                perfume['original_price'] = original_price
+                perfume['discounted_price'] = round(original_price * (1 - discount/100), 2)
                 
     except Exception as e:
         logger.error(f"Error retrieving special offers: {str(e)}")
@@ -763,13 +719,15 @@ def get_special_offers():
 def view_perfumes():
     min_price = request.args.get('min_price')
     max_price = request.args.get('max_price')
-    category = request.args.get('category')
     in_stock_only = request.args.get('in_stock_only', 'true').lower() == 'true'
 
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            base_sql = "SELECT id, name, description, price, quantity, available, category, size, top_notes, heart_notes, base_notes FROM perfumes WHERE available = 1"
+            base_sql = """
+                SELECT id, name, description, price, quantity, available, category, top_notes, heart_notes, base_notes 
+                FROM perfumes WHERE available = 1
+            """
             params = []
             
             if in_stock_only:
@@ -780,29 +738,20 @@ def view_perfumes():
             if max_price:
                 base_sql += " AND price <= %s"
                 params.append(float(max_price))
-            if category:
-                if category not in ['tops', 'lehangas', 'sarees']:
-                    return jsonify({'error': "Invalid category"}), 400
-                base_sql += " AND category = %s"
-                params.append(category)
             
             base_sql += " ORDER BY id DESC"
             cursor.execute(base_sql, params)
             perfumes = cursor.fetchall()
             
             base_url = request.host_url.rstrip('/')
-            for p in perfumes:
-                p['photo_url'] = f"{base_url}/perfumes/photo/{p['id']}"
-                p['in_stock'] = p['quantity'] > 0
-                p['stock_level'] = 'low' if p['quantity'] <= 5 else 'available'
-                if p.get('size'):
-                    p['sizes'] = [s.strip() for s in p['size'].split(',') if s.strip()]
-                else:
-                    p['sizes'] = []
+            for perfume in perfumes:
+                perfume['photo_url'] = f"{base_url}/perfumes/photo/{perfume['id']}"
+                perfume['in_stock'] = perfume['quantity'] > 0
+                perfume['stock_level'] = 'low' if perfume['quantity'] <= 5 else 'available'
                 
     except Exception as e:
-        logger.error(f"Error retrieving products: {str(e)}")
-        return jsonify({'error': 'Failed to retrieve products'}), 500
+        logger.error(f"Error retrieving perfumes: {str(e)}")
+        return jsonify({'error': 'Failed to retrieve perfumes'}), 500
     finally:
         conn.close()
     
@@ -814,7 +763,7 @@ def get_perfume_details(perfume_id):
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT id, name, description, price, quantity, available, category, size, top_notes, heart_notes, base_notes 
+                SELECT id, name, description, price, quantity, available, category, top_notes, heart_notes, base_notes 
                 FROM perfumes WHERE id = %s
             """, (perfume_id,))
             perfume = cursor.fetchone()
@@ -824,18 +773,14 @@ def get_perfume_details(perfume_id):
                 perfume['photo_url'] = f"{base_url}/perfumes/photo/{perfume['id']}"
                 perfume['in_stock'] = perfume['quantity'] > 0 and perfume['available'] == 1
                 perfume['stock_level'] = 'low' if perfume['quantity'] <= 5 else 'available'
-                if perfume.get('size'):
-                    perfume['sizes'] = [s.strip() for s in perfume['size'].split(',') if s.strip()]
-                else:
-                    perfume['sizes'] = []
     except Exception as e:
-        logger.error(f"Error retrieving product: {str(e)}")
-        return jsonify({'error': 'Failed to retrieve product'}), 500
+        logger.error(f"Error retrieving perfume: {str(e)}")
+        return jsonify({'error': 'Failed to retrieve perfume'}), 500
     finally:
         conn.close()
     
     if not perfume:
-        return jsonify({'error': 'Product not found'}), 404
+        return jsonify({'error': 'Perfume not found'}), 404
     return jsonify({'perfume': perfume}), 200
 
 @perfumes_bp.route('/perfumes/photo/<int:perfume_id>', methods=['GET'])
@@ -853,6 +798,7 @@ def get_photo(perfume_id):
     return jsonify({'error': 'Photo not found'}), 404
 
 # ==================== REVIEW ROUTES ====================
+
 def validate_review_data(rating, comment=None):
     """Validate review data. Returns (is_valid, error_message)"""
     try:
@@ -1146,9 +1092,6 @@ def get_user_reviews(user_id):
         conn.close()
     
     return jsonify({'reviews': user_reviews}), 200
-
-
-
 # --------------------------------------------------------------
 #  NEW PUBLIC ENDPOINT – show *all* reviews
 # --------------------------------------------------------------
@@ -1226,3 +1169,33 @@ def get_all_reviews():
             } for r in all_reviews
         ]
     }), 200
+
+
+
+
+
+@perfumes_bp.route('/contact', methods=['POST'])
+def contact():
+    data = request.json
+    name = data.get('name')
+    email = data.get('email')
+    subject = data.get('subject')
+    message = data.get('message')
+
+    # Compose email
+    msg = MIMEMultipart()
+    msg['From'] = SMTP_USER
+    msg['To'] = ADMIN_EMAIL
+    msg['Subject'] = f"Contact Form: {subject}"
+    body = f"Name: {name}\nEmail: {email}\nSubject: {subject}\nMessage: {message}"
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, ADMIN_EMAIL, msg.as_string())
+        server.quit()
+        return jsonify({"success": True, "message": "Message sent to admin."}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500

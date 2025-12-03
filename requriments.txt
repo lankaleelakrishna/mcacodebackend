@@ -5,3 +5,27 @@ PyJWT==2.8.0
 Werkzeug==2.3.7
 
 
+
+
+# Project Setup Requirements
+
+Step 1: Download and install Node.js from https://nodejs.org/
+
+Step 2: Extract the project folder, open Command Prompt, and run:
+        cd mca
+        code .
+
+Step 3: After VS Code opens, open a new terminal and select:
+        Command Prompt
+
+Step 4: Run the development server:
+        npm run dev
+
+
+# Admin Authentication Endpoints
+
+1. POST /admin/login
+   Description: Admin login endpoint.
+
+2. POST /admin/signup
+   Description: Admin signup/registration endpoint.
